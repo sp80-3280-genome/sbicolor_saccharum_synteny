@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+
+# Author version
+__version__ = '0.01'
+__author__ = ['Gianlucca Nicastro','Robson Francisco de Souza']
+
+# Load external / standard libraries
+from  datetime import datetime as dt
+import argparse
+import pandas as pd
+import numpy as np
+import sys
+import os
+
+# Import rotifer
+sys.path.insert(0, os.path.join('/home/kaihami/mymodules'))
+import rotifer.algorithm.unionfind as ufind
+import rotifer.core.cli as corecli
+
+# Build CLI parser and process command line
+def parse_cli():
+    # OK
+    parser = corecli.parser()
+    #parser = argparse.ArgumentParser()
+
+    parser.add_argument('-aid', '--analysis',
+        help    = 'Identifier for this run (default: None)',
+        type    = str,
+        )
+
+    parser.add_argument('-a', '--annotated',
+        help    = 'Save the annotated input table for debugging (default: None)',
+        type    = argparse.FileType('w')
+        )
+
+    parser.add_argument('-g', '--groups',
+        help    = 'File name for row-based representation of the orthologous groups (OG) (default: None)',
+        type    = argparse.FileType('w')
+        )
+
+    parser.add_argument('-mao', '--maximum_overlap',
+        help = 'Force a maximum number of residues, on the query sequences of two HSPs, that are allowed to overlap (default: None).',
+        type    = int,
+        default = 500
+        )
+
+    parser.add_argument('-mc', '--minimum_coverage',
+        help    = 'Minimum length of all aligned regions over the query sequence. Expressed as percentage of the query length (default: 0.7).',
+        type    = float,
+        default = 0.7
+        )
+
+    parser.add_argument('-mi', '--minimum_identity',
+        help    = 'Minimum percentage identity between query and subject sequences (default: 0.8).',
+        type    = float,
+        default = 0.8
+        )
+
+    parser.add_argument('-ml', '--minimum_layer',
+        help    = 'Layer (identifier) attributed to unprocessed HSPs. Should be set to a large negative number (default: -65536).',
+        type    = int,
+        default = -65536
+        )
+
+    parser.add_argument('-mio', '--minimum_overlap',
+        help    = 'Force a minimum number of residues, on the query sequences of two HSPs, that are allowed to overlap (default: None).',
+        type    = int,
+        default = 0
+        )
+
+    parser.add_argument('-po', '--pairwise_overlap',
+        help    = "Maximum proportion (percentage) of aligned query residues allowed to overlap. The number of overlapping residues depends on the length of the query sequence but it will always be forced to be within the interval [--minimum_overlap,--maximum_overlap] (default: 0.0)",
+        type    = float,
+        default = 0
+        )
+
+    parser.add_argument('-of', '--outfile',
+        help    = "Output fie name (default: stdout)",
+        type = argparse.FileType('w'),
+        default = sys.stdout
+        )
+
+    parser.add_argument('-r', '--rename',
+        help    = "Map to rename sequences before completing the analysis: text table with two columns, old and new values, respectively.",
+        type = argparse.FileType('r')
+        )
+
+    parser.add_argument('-s', '--similarity',
+        help    = 'File name for the matrix of sequence similarities (default: None)',
+        type    = argparse.FileType('w')
+        )
+
+    parser.add_argument('table',
+        help    = 'Input file name.',
+        nargs   = '*',
+        default = []
+        )
+
+    parser.add_argument('-v','--verbose',
+        action  = 'count',
+        help    = 'Set verbosity level (default: 0).',
+        default = 0
+        )
+
+    parser2 = corecli.config().input()
+
+    # Parse
+    args = corecli.parseargs(parents = [parser, parser2], exclude_from_dump = 'table')
+    #args = parser.parse_args()
+    return args
+
+############################################################
+# Set bitscoreID (equivalent to our HSP selection criteria)
+# and add number of HSPs per (query,subject) pair
+def debug(message, minimum_verbosity = 0, options = None):
+    if options == None: # If you say nothing, I assume verbosity is off
+        return
+    elif options.verbose == None: # Same as above
+        return
+    elif options.verbose < minimum_verbosity: # Check verbosity level: should we give up printing?
+        return
+    if type(message) != list: message = [message]
+    now = dt.now().strftime('[%D %H:%M:%S]')
+    for f in message:
+        print("{} ({}) {}".format(now, minimum_verbosity, f), file=sys.stderr)
+    sys.stderr.flush() # Print stderr messages immediatly
+
+############################################################
+# Print statistics on a dataframe, including counts for
+# number of rows and entries of two selected columns (first
+# and second arguments).
+def debug_df(df, message = 'Table statistics:', first = None, second = None, minimum_verbosity = 0, options = None):
+    if options == None:
+        return
+    elif options.verbose == None:
+        return
+    elif options.verbose < minimum_verbosity:
+        return
+    now    = dt.now().strftime('[%D %H:%M:%S]') + ' ({})'.format(minimum_verbosity)
+    ncols  = len(df.columns)
+    memory = df.memory_usage().sum()/(1024**3)
+    stats  = pd.DataFrame([[now, memory  , ncols   ,len(df)]], \
+                   columns=[now,'mem(GB)','columns', 'rows'])
+    if ((first != None) & (second != None)):
+        stats  = df.groupby([first,second]).size()
+        stats  = stats.reset_index()
+        stats.columns = [first,second,'nstats']
+        nstats = len(stats)
+        stats.loc[stats[first] > stats[second],[first,second]] = stats.loc[stats[first] > stats[second],[second,first]].values
+        stats  = stats.groupby([first,second]).size()
+        stats  = stats.reset_index()
+        nelem  = len(set(stats[first].values).union(stats[second].values))
+        stats  = pd.DataFrame([[now, memory  , ncols   ,len(df),  nelem   ,   nstats   , len(stats) ]], \
+                       columns=[now,'mem(GB)','columns', 'rows','elements','pairs(all)', 'pairs(nr)'])
+    stats[now] = dt.now().strftime('[%D %H:%M:%S]') + ' ({})'.format(minimum_verbosity)
+    print("{} {}".format(now, message), file=sys.stderr)
+    print(stats.to_string(index=False, float_format='%.4f'), file=sys.stderr)
+    print("{} {}".format(stats.loc[0,now], '+columns: [{}]'.format(", ".join(df.columns))), file=sys.stderr)
+    sys.stderr.flush() # Print stderr messages immediatly
+
+############################################################
+# Scan and compare HSPs to detect and annotate overlaps
+def annotate_hsps_by_overlap(df, options, pairwise_overlap = 0, minimum_layer = -65536):
+    debug("Initializing table processing: sorting...", options = options, minimum_verbosity = 1)
+    df.sort_values(['qseqid','sseqid','bitscore','length','nident','qstart','qend','sstart','send'], ascending=[True,True,False,False,False,True,True,True,True], inplace=True)
+    df.reset_index(inplace=True,drop=True)
+    df.index.names = ['bitscoreID']
+    df.reset_index(inplace=True)
+
+    # Indexing HSPs and calculating number of HSPs per query/subject pair
+    debug("Adding index and number of HSPs (per query and subject pair) to table...", options = options, minimum_verbosity = 1)
+    c=df.groupby(['qseqid','sseqid']).agg({'bitscoreID':'count'}).reset_index()
+    df=df.merge(c,left_on=['qseqid','sseqid'],right_on=['qseqid','sseqid'],how='inner')
+    df.rename(index=str,columns={'bitscoreID_x':'bitscoreID','bitscoreID_y':'nhsps'},inplace=True)
+    df[['bitscoreID', 'nhsps']] = df[['bitscoreID', 'nhsps']].astype(np.int32)
+    debug_df(df, message="HSPs indexed! Table statistics:", first='qseqid', second='sseqid', options = options, minimum_verbosity = 2)
+
+    # Annotate alignments with one HSP
+    layer = -1
+    debug("Layer: {}, Number of HSPs: {}".format(layer,len(df)), options = options, minimum_verbosity = 3)
+    df['overlap'] = [minimum_layer] * len(df)
+    df.loc[df.nhsps == 1,'overlap'] = [layer] * len(df[df.nhsps == 1])
+
+    # Overlaps: build dataframe of valid pairwise comparions (HSP x HSP)
+    debug("Building HSP x HSP matrix and selecting valid comparisons...", options = options, minimum_verbosity = 1)
+    m = df[df.nhsps != 1].merge(df[df.nhsps != 1], left_on=['qseqid','sseqid'], right_on=['qseqid','sseqid'], how='inner')
+    m = m[m.bitscoreID_x > m.bitscoreID_y]
+    tolerance = np.ceil(np.where(m.length_x < m.length_y, m.length_x, m.length_y) * options.pairwise_overlap).astype(int) # Calculate tolerance based on the shortest query
+    tolerance = np.where(tolerance > options.maximum_overlap, options.maximum_overlap, np.where(tolerance < options.minimum_overlap, options.minimum_overlap, tolerance))
+    m = m[~((m.qstart_x > m.qend_y - tolerance) | (m.qend_x - tolerance < m.qstart_y))] # It means: x is worst than y AND both overlap
+    m = m[['qseqid', 'sseqid', 'bitscoreID_x','bitscoreID_y','qstart_x', 'qend_x', 'qstart_y', 'qend_y']]
+
+    # Annotate HSPs that do not overlap higher scoring HSPs
+    layer = -2
+    debug("Layer: {}, Number of HSP pairs: {}".format(layer,len(m)), options = options, minimum_verbosity = 3)
+    overlapIdx = list(df.columns.values).index('overlap')
+    g = list(set(df[df.nhsps != 1].bitscoreID) - set(m.bitscoreID_x))
+    df.iloc[g,overlapIdx] = [layer] * len(g)
+    df['overlap'] = df['overlap'].astype(np.int32)
+
+    # Iterate until all HSPs described by the leftmost columns ('_x') are annotated
+    debug("Annotating HSPs...", options = options, minimum_verbosity = 1)
+    m = m.merge(df[['qseqid','sseqid','bitscoreID','overlap']], left_on=['qseqid','sseqid','bitscoreID_y'], right_on=['qseqid','sseqid','bitscoreID'], how='inner') 
+    m = m[['qseqid', 'sseqid', 'bitscoreID_x','bitscoreID_y','qstart_x', 'qend_x', 'qstart_y', 'qend_y','overlap']]
+    layer = -3
+    while len(m) > 0:
+        debug("Layer: {}, Number of HSP pairs: {}".format(layer,len(m)), options = options, minimum_verbosity = 3)
+        # Detect and store overlapping HSPs
+        mg = m.groupby(['qseqid','sseqid','bitscoreID_x'])
+        a = mg.agg({'overlap' : 'min', 'bitscoreID_y': 'min'})
+        a.reset_index(inplace=True)
+        a = a[a.overlap != minimum_layer]
+        a['overlap'] = np.where(a.overlap < 0, a.bitscoreID_y, layer)
+        df.iloc[a.bitscoreID_x.values,overlapIdx] = a.overlap.values
+
+        # Cleanup HSP x HSP comparison matrix and copy the new HSP annotations to this matrix
+        a.drop('bitscoreID_y', inplace=True, axis=1)
+        a.columns = ['qseqid', 'sseqid', 'bitscoreID_y', 'overlap_y'] # bitscoreID_x will be bitscoreID_y on the next iteration 
+        m = m[~m.bitscoreID_x.isin(set(a.bitscoreID_y))].copy() # Cleanup
+        m = m.merge(a, left_on=['qseqid','sseqid','bitscoreID_y'], right_on=['qseqid','sseqid','bitscoreID_y'], how='left')
+        m.loc[~m.overlap_y.isna(),'overlap'] = m.loc[~m.overlap_y.isna()].overlap_y.astype(np.int32)
+        m.drop('overlap_y', inplace=True, axis=1)
+        layer -= 1
+
+    # Remove HSPs that overlap better scoring HSPs
+    df = df[df.overlap < 0]
+    debug_df(df, message="Table statistics after removal of HSPs with overlap index < 0:", first='qseqid', second='sseqid', options = options, minimum_verbosity = 2)
+
+    # Print debugging messages and return
+    return df
+
+############################################################
+# Collapse (group) HSPs into a single data row and aggregate
+# and select data for each of the desired statistics
+def collapse_and_filter_hsps(df, options):
+    '''
+    This function collapses all rows in a dataframe of
+    HSPs, i.e. a dataframe with data corresponding to
+    the standard m6 output format of the BLAST package plus
+    the non-standard qlen, slen, qcovs and nident columns.
+    
+    It also removes the redundancy of swaped (query,subject)
+    and (subject,query) rows, to generate a table of 
+    query-only data, and calculates the coverage and percent
+    identity in relation to the whole query length(s).
+    '''
+
+    debug("Collapsing HSPs...", options = options, minimum_verbosity = 1)
+    df = df.groupby(['qseqid','sseqid']).agg({'bitscore':'sum','nident':'sum','length':'sum','qcovs':'first','qlen':'first','slen':'first'})
+    df = df.reset_index()
+    df['qcov']    = np.where(df.length > df.qlen, 1, df.length / df.qlen)
+    df['scov']    = np.where(df.length > df.slen, 1, df.length / df.slen)
+    df['qpident'] = np.where(df.nident > df.qlen, 1, df.nident / df.qlen)
+    df['spident'] = np.where(df.nident > df.slen, 1, df.nident / df.slen)
+    debug_df(df, message="Table statistics after HSPs are reduced to a single row:", first='qseqid', second='sseqid', options = options, minimum_verbosity = 2)
+
+    # Merge data from forward (A->B) and (B->A) reverse searches
+    df = df[df.qseqid.map(str.lower) <= df.sseqid.map(str.lower)].merge( \
+         df[df.qseqid.map(str.lower) >= df.sseqid.map(str.lower)], \
+         left_on=['qseqid','sseqid'], right_on=['sseqid','qseqid'], how='outer')
+    debug_df(df, message="Table statistics after cross product (a.k.a. merge or join) with itself:", first='qseqid_x', second='sseqid_x', options=options, minimum_verbosity=2)
+
+    # Copy data from the reverse search to the forward search when the forward is missing
+    idx = df[df.qseqid_x.isna()].index
+    df.loc[idx,['bitscore_x','qseqid_x','sseqid_x','nident_x','length_x','qcovs_x','qlen_x','qcov_x','qpident_x']] = \
+    df.loc[idx,['bitscore_y','qseqid_y','sseqid_y','nident_y','length_y','scov_y' ,'slen_y','scov_y','spident_y']].values
+    idx = idx.intersection(df[df.qseqid_x.map(str.lower) > df.sseqid_x.map(str.lower)].index)
+    df.loc[idx,['sseqid_x','qseqid_x']] = df.loc[idx,['qseqid_x','sseqid_x']].values
+
+    # Copy data from the forward search to the reverse search when the reverse is missing
+    idx = df[df.qseqid_y.isna()].index
+    df.loc[idx,['bitscore_y','qseqid_y','sseqid_y','nident_y','length_y','qcovs_y','qlen_y','qcov_y','qpident_y']] = \
+    df.loc[idx,['bitscore_x','qseqid_x','sseqid_x','nident_x','length_x','scov_x' ,'slen_x','scov_x','spident_x']].values
+    idx = idx.intersection(df[df.qseqid_y.map(str.lower) > df.sseqid_y.map(str.lower)].index)
+    df.loc[idx,['sseqid_y','qseqid_y']] = df.loc[idx,['qseqid_y','sseqid_y']].values
+    debug_df(df, message="Table statistics after filling up empty columns generated by merge:", first='qseqid_x', second='sseqid_x', options = options, minimum_verbosity = 2)
+
+    # Selecting query columns
+    df.drop(columns=['qseqid_y','sseqid_y','bitscore_y','spident_x','spident_y','slen_x','slen_y','scov_x','scov_y'], inplace=True)
+    df.columns = ['qseqid','sseqid','bitscore','qnident', 'qlength','qcovs','qlen','qcov','qpident','snident','slength','scovs','slen','scov','spident']
+    df[['qnident', 'qlength','qlen','snident','slength','slen']] = df[['qnident', 'qlength','qlen','snident','slength','slen']].astype(np.int32)
+    df[['qcovs','qcov','qpident','scovs','scov','spident']] = df[['qcovs','qcov','qpident','scovs','scov','spident']].astype(np.float32)
+    debug_df(df, message="Table statistics after removal of subject columns:", first='qseqid', second='sseqid', options = options, minimum_verbosity = 2)
+
+    # Filter
+    df = df[(df.qpident >= args.minimum_identity) & (df.spident >= args.minimum_identity) & (df.qcovs >= args.minimum_coverage) & (df.scovs >= args.minimum_coverage)]
+    debug_df(df, message="Table statistics after filtering by identity and coverage:", first='qseqid', second='sseqid', options = options, minimum_verbosity = 2)
+
+    # Rename sequences and reduce table
+    if options.rename != None:
+        debug("Renaming query and hit...", options = options, minimum_verbosity = 2)
+        df = update_columns(df, options, columns=['qseqid','sseqid'])
+        df.sort_values(['qseqid','sseqid','bitscore','qlength','qpident','spident','qcovs','scovs'], \
+             ascending=[  True  ,  True  ,   False  ,  False  ,  False  ,  False  , False , False ], \
+             inplace=True)
+        df = df.groupby(['qseqid','sseqid']).first()
+        df.reset_index(inplace=True)
+        df = df[df.qseqid != df.sseqid]
+        debug_df(df, message="Table statistics after renaming sequences:", first='qseqid', second='sseqid', options = options, minimum_verbosity = 2)
+
+    # Return 'collapsed' dataframe
+    return df 
+
+# Rename sequences
+def update_columns(df, options, columns = []):
+    if ((options.rename == None) | (len(columns) == 0)): return df
+    rename = load_map(options.rename)
+    debug("Renaming dictionary has {} keys and {} values.".format(len(set(rename.keys())),len(set(rename.values()))), options = options, minimum_verbosity = 3)
+    targets = set()
+    for col in columns:
+        targets = targets.union(set(df[col]))
+    for elm in targets:
+            if elm in rename:
+                pass
+            else:
+                rename[elm] = elm
+    for col in columns:
+        df[col] = df[col].map(rename.get)
+    return df
+
+# Load mapping of old to new sequence names
+def load_map(filename):
+    rename = pd.read_csv(filename, sep="\t", header=None)
+    rename.columns = ['old','new']
+    rename = pd.Series(rename.new.values,index=rename.old).to_dict()
+    return rename
+
+# Load input
+def load_hsps(options):
+    debug("Loading tables...", minimum_verbosity = 1, options = options)
+
+    # Load all input
+    df = pd.read_csv(options.table[0], sep="\t", header=None)
+    for fname in options.table[1:]:
+        df.append(pd.read_csv(fname, sep="\t", header=None))
+    df.columns=['qseqid','sseqid','pident','length','mismatch','gapopen','qstart','qend','sstart','send','evalue','bitscore','qcovs','qlen','slen','nident']
+    debug_df(df, message="Table statistics for the raw input:", first='qseqid', second='sseqid', options = options, minimum_verbosity = 2)
+
+    # Set column names and types
+    df.drop(columns=['mismatch','gapopen'], inplace=True)
+    df[['length','qstart','qend','sstart','send','qlen','slen','nident']] = \
+    df[['length','qstart','qend','sstart','send','qlen','slen','nident']].astype(np.int32)
+    df[['pident','bitscore']] = df[['pident','bitscore']].astype(np.float32)
+
+    # Filter input by query sequence alignment coverage
+    df[['qcovs']] = df[['qcovs']].astype(np.float32) / 100.0
+    df = df[df.qcovs >= options.minimum_coverage];
+    debug_df(df, message="Table statistics after first minimum coverage filter:", first='qseqid', second='sseqid', options = options, minimum_verbosity = 2)
+
+    # Remove self-matches
+    df = df[df.qseqid != df.sseqid]
+    debug_df(df, message="Table statistics after removing self-matches:", first='qseqid', second='sseqid', options = options, minimum_verbosity = 2)
+
+    # Add strand column (useful for nucleotide data)
+    df['strand'] = ['+'] * len(df)
+    df.loc[df.qstart > df.qend,'strand'] = ['-'] * len(df.loc[df.qstart > df.qend]) # Identify alignments to reverse complement of the subject
+    df['strand'] = df['strand'].astype('category') # GGN make this column as category type to save memory
+    df.loc[df.sstart > df.send,['sstart','send']] = df.loc[df.sstart > df.send,['send','sstart']].values # Swap negative strand HSP coordinates
+    return(df)
+
+# Load dataset
+# Example: df[(df.qseqid == 'Sobic.001G000200.1') & (df.sseqid == 'Sspon.001B0038910')]
+if __name__ == '__main__':
+    args = parse_cli()
+    df = load_hsps(args)
+
+    # Process HSPs
+    df = annotate_hsps_by_overlap(df, options = args, pairwise_overlap = args.pairwise_overlap, minimum_layer = args.minimum_layer)
+    if args.annotated  != None: print(df.to_csv(sep="\t", index=False, float_format='%.4f'), file=args.annotated, end='')
+    df = collapse_and_filter_hsps(df,args)
+    if args.similarity != None: print(df.to_csv(sep="\t", index=False, float_format='%.4f'), file=args.similarity, end='')
+
+    # Build clusters
+    df = ufind.Disjoint(df, 'qseqid','sseqid').rdf()
+    df.columns = ['Node','id','Components']
+    debug_df(df, message="Statistics for orthologous groups:", minimum_verbosity = 1, options = args)
+    df.sort_values(['id','Node'], ascending=[False,True], inplace=True)
+    print(df.to_csv(sep="\t", index=False, float_format='%.4f'), file=args.outfile, end='')
+    
+    # If requested, format table of orthologous groups with one group per row (blastclust-like)
+    if args.groups != None:
+        df = df.groupby('id').agg({'Node':lambda x: " ".join(x), 'Components':'first'})
+        df.reset_index(inplace=True)
+        if args.analysis == None:
+            if args.groups == None:
+                df['analysis'] = options.table[0]
+            else:
+                df['analysis'] = args.groups.name
+        else:
+            df['analysis'] = args.analysis
+        df = df[['analysis','gid','gsize','node']]
+        print(df.to_csv(sep="\t", index=False, float_format='%.4f'), file=args.groups, end='')
+
+    # Exit
+    sys.exit(0)
